@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+import os, re, time, sys
+import shutil
+from pprint import pprint as P
+import argparse
+import signal
+
+
+TERM_WIDTH = 80
+TERM_HEIGHT = 100
+
+
+MIN_DIFF = 0
+HILI_IRQ = set()
+HILI_CPU = set()
+
+def main():
+    global MIN_DIFF
+    global HILI_IRQ
+    global HILI_CPU
+
+
+    ap = argparse.ArgumentParser(description="irqstats")
+    ap.add_argument("-m", "--min-diff", metavar="N", type=int, help="threshold for showing diffs", default=1)
+    ap.add_argument("-c", "--cpu", action="store_true", help="show per-cpu")
+    ap.add_argument("-u", "--cpu-usage", action="store_true", help="show cpu usage")
+    ap.add_argument("-i", "--irq", action="store_true", help="show per-irq (default)", default=True)
+    ap.add_argument("-p", "--pretty", action="count", help="interactive mode", default=0)
+    ap.add_argument("-s", "--skip", metavar="IRQs", help="skip IRQ")
+    ap.add_argument("--hilight-cpus", metavar="CPU")
+    ap.add_argument("--hilight-irqs", metavar="IRQ")
+    ap.add_argument("--no-clear", action="store_true", default=False, help="stop clearing pretty display")
+
+    args = ap.parse_args()
+
+    global TERM_WIDTH
+    global TERM_HEIGHT
+    TERM_WIDTH, TERM_HEIGHT = shutil.get_terminal_size()
+    MIN_DIFF = args.min_diff
+    if args.pretty == 0:
+        p = DumbPrinter(3)
+    elif args.pretty == 1:
+        p = PrettyPrinter(3)
+    elif args.pretty >= 2:
+        p = TerminalSizePrettyPrinter(3)
+
+    signal.signal(signal.SIGWINCH, on_win_change)
+    skipped = set()
+    if args.skip:
+        for irq in args.skip.split(","):
+            skipped.add(irq)
+    old = read_data(skipped)
+    start = old
+
+    if args.hilight_cpus:
+        for cpu in interval_to_list(args.hilight_cpus):
+            HILI_CPU.add(cpu)
+
+    if args.hilight_irqs:
+        for irq in interval_to_list(args.hilight_irqs):
+            HILI_IRQ.add(irq)
+
+    while True:
+        time.sleep(1)
+        new = read_data(skipped)
+        if args.irq:
+            p.set_col(0)
+            show_irq_diff(p, start, old, new)
+        if args.cpu:
+            p.set_col(1)
+            show_cpu_diff(p, start, old, new)
+        if args.cpu_usage:
+            p.set_col(2)
+            show_cpu_usage_diff(p, start, old, new)
+        old = new
+        p.display(clear=not args.no_clear)
+        p.clear()
+
+def on_win_change(sig, frame):
+    global TERM_WIDTH
+    global TERM_HEIGHT
+    TERM_WIDTH, TERM_HEIGHT = shutil.get_terminal_size()
+
+def compute_cpu_usage_diff(old, new, k=None):
+    n_idle = new['idle'] + new['iowait']
+    o_idle = old['idle'] + old['iowait']
+
+    n_nidle = new['user'] + new['nice'] + new['system'] + new['irq'] + new['softirq'] + new['steal']
+    o_nidle = old['user'] + old['nice'] + old['system'] + old['irq'] + old['softirq'] + old['steal']
+
+    n_total = n_idle + n_nidle
+    o_total = o_idle + o_nidle
+
+    total = n_total - o_total
+    idle = n_idle - o_idle
+    if k is None:
+        return (total-idle)*100//total
+    else:
+        return (new[k]-old[k])*100//total
+
+def show_cpu_usage_diff(p, start, old, new):
+    p.print("TOP CPU USAGE")
+
+    used = []
+    for cpu, vals in new['usage'].items():
+        if cpu != 'all':
+            usage = compute_cpu_usage_diff(old['usage'][cpu], new['usage'][cpu])
+            if usage > 2:
+                used.append({'cpu': cpu, 'usage': usage})
+                new['usage'][cpu]['usage'] = usage
+                if 'usage' not in old['usage'][cpu]:
+                    old['usage'][cpu]['usage'] = usage
+
+    used.sort(key=lambda x: x['usage'], reverse=True)
+    for cpu in used:
+        cpu_perc = cpu_usage_hilight("%3d%%"%cpu['usage'], cpu['usage'])
+        p.print("%s: %s"%(cpu_name(cpu['cpu']), cpu_perc), end="")
+        shortnames = {'user': 'usr', 'system': 'sys', 'irq': 'irq', 'softirq':'sirq', 'steal':'steal'}
+        for k in ['user', 'nice', 'system', 'irq', 'softirq', 'steal']:
+            if k == 'usage':
+                continue
+            perc = compute_cpu_usage_diff(old['usage'][cpu['cpu']], new['usage'][cpu['cpu']], k)
+            if perc > 1:
+                s = " %s:%2d%%"%(shortnames[k].rjust(4), perc)
+                s = cpu_usage_hilight(s, perc)
+                p.print(s, end="")
+        p.print("")
+
+def read_data(skipped):
+    r = read_proc_int(skipped)
+    r['usage'] = read_cpu_usage()
+    return r
+
+def read_cpu_usage():
+    with open("/proc/stat") as f:
+        buf = f.read()
+    r = {}
+    for s in buf.splitlines():
+        xs = s.split()
+        name = xs[0]
+        if name.startswith('cpu'):
+            vals = [int(x) for x in xs[1:]]
+            vals = {'user': vals[0], 'nice': vals[1], 'system': vals[2], 'idle': vals[3], 'iowait': vals[4], 'irq': vals[5], 'softirq': vals[6], 'steal': vals[7], 'guest': vals[8], 'guest_nice': vals[9]}
+            if len(name) == 3:
+                r['all'] = vals
+            else:
+                r[int(name[3:])] = vals
+    return r
+
+def read_proc_int(skipped):
+    with open("/proc/interrupts") as f:
+        buf = f.read()
+    ls = buf.splitlines()
+    nbcpu = int(ls[0].split()[-1][3:])+1
+    cpusum = [0]*nbcpu
+    r = {'nbcpu': nbcpu, 'meta':{}, 'irq':{}}
+    for s in ls[1:]:
+        xs = s.split(None, nbcpu+1)
+        n = xs[0][:-1]
+        nb = list(map(int, xs[1:-1]))
+        #print(nb)
+        if n in skipped:
+            continue
+        data = {'desc': xs[-1], 'nb': nb, 'sum': sum(nb)}
+        if n[0] not in '0123456789':
+            if n in ('LOC', 'ERR', 'MIS'):
+                r['meta'][n] = data
+            else:
+                r['irq'][n] = data
+        else:
+            r['irq'][int(n)] = data
+            for i,cnt in enumerate(nb):
+                cpusum[i] += cnt
+
+    r['cpusum'] = cpusum
+    return r
+
+
+def shortnum(n):
+    # if n > 1000:
+    #     return "%dk"%(n/1000)
+    return "%d"%n
+
+def desc(data, irq):
+    s = data['irq'][irq]['desc']
+    if isinstance(irq, int):
+        xs = s.split()
+        return xs[-1].rjust(30)
+    else:
+        return s.rjust(30)
+
+def compute_irq_diff(old, new):
+    changed = []
+    for irq in new['irq'].keys():
+        if old['irq'][irq]['sum'] <= new['irq'][irq]['sum']-MIN_DIFF:
+            cpu_inc = []
+            total_inc = 0
+            for cpu in range(0, new['nbcpu']):
+                inc = new['irq'][irq]['nb'][cpu] - old['irq'][irq]['nb'][cpu]
+                total_inc += inc
+                if inc > 0:
+                    cpu_inc.append((cpu, inc))
+            changed.append({'irq': irq, 'cpu': cpu_inc, 'total_inc': total_inc})
+    return changed
+
+def hilight(s):
+    return "\x1b[36m%s\x1b[m"%s
+
+def cpu_usage_hilight(s, perc):
+    if perc < 10:
+        return s
+    elif perc < 70:
+        return "\x1b[33m"+s+"\x1b[0m"
+    else:
+        return "\x1b[31m"+s+"\x1b[0m"
+
+def irq_name(x, short=False):
+    if isinstance(x, int):
+        if short:
+            r = "IRQ%d"%x
+        else:
+            r = "IRQ %3d"%x
+    else:
+        if short:
+            r = x
+        else:
+            r = x.ljust(7)
+    if x in HILI_IRQ:
+        r = hilight(r)
+    return r
+
+def cpu_name(x):
+    r = "CPU%-2d"%x
+    if x in HILI_CPU:
+        r = hilight(r)
+    return r
+
+
+def show_irq_diff(p, start, old, new):
+    changed = compute_irq_diff(old, new)
+    start_changed = compute_irq_diff(start, new)
+    irqmap = {}
+    for x in changed:
+        irqmap[x['irq']] = x
+
+    changed.sort(key=lambda x: x['total_inc'], reverse=True)
+    start_changed.sort(key=lambda x: x['total_inc'], reverse=True)
+
+    p.print("TOP IRQ FIRED")
+    for i, cs in enumerate(start_changed):
+        if cs['irq'] in irqmap:
+            c = irqmap[cs['irq']]
+        else:
+            c = {'irq': cs['irq'], 'cpu': [], 'total_inc':0}
+        p.print("%s %s: %7d"%(irq_name(c['irq']), desc(old, c['irq']), cs['total_inc']), end="")
+        if c['total_inc'] > 0:
+            p.print(" +%s ("%shortnum(c['total_inc']), end='')
+            if len(c['cpu']) > 5:
+                s = "CPU %s"%list_to_interval([x[0] for x in c['cpu']])
+                if any([x[0] in HILI_CPU for x in c['cpu']]):
+                    s = hilight(s)
+                p.print(s, end="")
+            else:
+                for cpu in sorted(c['cpu'], key=lambda x: x[1], reverse=True):
+                      p.print("%s +%s "%(cpu_name(cpu[0]), cpu[1]), end='')
+            p.print(')', end='')
+        p.print('')
+
+def compute_cpu_diff(old, new):
+    return [(i, new['cpusum'][i] - old['cpusum'][i]) for i in range(new['nbcpu'])]
+
+def show_cpu_diff(p, start, old, new):
+    p.print("TOP CPU IRQ HANDLER")
+    cpusum = compute_cpu_diff(old, new)
+    start_cpusum = compute_cpu_diff(start, new)
+    cpusum.sort(key=lambda x: x[1], reverse=True)
+    start_cpusum.sort(key=lambda x: x[1], reverse=True)
+    cpumap = {x[0]: x for x in cpusum}
+    for i, (start_cpu, start_inc) in enumerate(start_cpusum):
+        if start_cpu in cpumap:
+            cpu, inc = cpumap[start_cpu]
+        else:
+            cpu = start_cpu
+            inc = 0
+        if start_inc < MIN_DIFF:
+            continue
+        p.print("%s: %7d"%(cpu_name(cpu), start_inc), end="")
+        if inc > MIN_DIFF:
+            p.print(" +%s ("%shortnum(inc), end="")
+            changed = {}
+            for irq in new['irq'].keys():
+                diff = new['irq'][irq]['nb'][cpu] - old['irq'][irq]['nb'][cpu]
+                if diff > 0:
+                    changed[irq] = diff
+            for irq, diff in sorted(changed.items(), key=lambda x: x[1], reverse=True):
+                p.print("%s +%s "%(irq_name(irq, short=True), shortnum(diff)), end="")
+            p.print(")", end="")
+        p.print("")
+
+class Printer():
+    def __init__(self, cols=None):
+        pass
+    def print(self, *args, **kwargs):
+        pass
+    def set_col(self, n):
+        pass
+    def clear(self, n=None):
+        pass
+    def display(self, clear=None):
+        pass
+
+
+class DumbPrinter(Printer):
+    def __init__(self, cols=None):
+        pass
+    def print(self, *args, **kwargs):
+        print(*args, **kwargs)
+    def set_col(self, n):
+        pass
+    def clear(self, n=None):
+        print("\n")
+    def display(self, clear=None):
+        pass
+
+
+def str_len_escape(s):
+    s = re.sub(r'\x1b\[(?:(?:[0-9]+|;)*[A-Za-z])', '', s)
+    return len(s)
+
+class PrettyPrinter(Printer):
+    def __init__(self, cols=1):
+        self.buflist = []
+        for i in range(cols):
+            self.buflist.append([])
+        self.buf = self.buflist[0]
+
+    def set_col(self, n):
+        self.buf = self.buflist[n]
+
+    def clear(self, n=None):
+        if n is None:
+            for b in self.buflist:
+                b.clear()
+        else:
+            self.buflist[n].clear()
+
+    def print(self, *args, end="\n", col=None):
+        if col is None:
+            b = self.buf
+        else:
+            b = self.buflist[col]
+
+        lines = ((' '.join([*args]))+end).splitlines(keepends=True)
+        if len(b) == 0:
+            for x in lines:
+                b.append(x)
+        else:
+            if b[-1][-1] == '\n':
+                for x in lines:
+                    b.append(x)
+            else:
+                b[-1] += lines[0]
+                for x in lines[1:]:
+                    b.append(x)
+
+    def compute_size(self):
+        self.heights = []
+        self.widths = []
+        for b in self.buflist:
+            if len(b) == 0:
+                w = 0
+            else:
+                w = max([str_len_escape(x) for x in b])
+            self.widths.append(w)
+            self.heights.append(len(b))
+
+    def display(self, clear=True):
+        if clear:
+            print('\x1b[1J\x1b[H', end='')
+
+        self.compute_size()
+        maxh = max(self.heights)
+
+        for line in range(maxh):
+            for col, b in enumerate(self.buflist):
+                if line < len(b):
+                    sline = b[line].rstrip()
+                    real_len = str_len_escape(sline)
+                    if real_len > self.widths[col]:
+                        sline = sline[:self.widths[col]] + "\x1b[0m"
+                    elif real_len < self.widths[col]:
+                        sline += " "*(self.widths[col]-real_len)
+                    print(sline, end='')
+                else:
+                    print(' '*self.widths[col], end='')
+                if col != len(self.buflist)-1:
+                    print('| ', end='')
+                else:
+                    print()
+
+class TerminalSizePrettyPrinter(PrettyPrinter):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def compute_size(self):
+        global TERM_WIDTH
+        global TERM_HEIGHT
+        self.heights = []
+        self.widths = []
+        avail = TERM_WIDTH-2*(len(self.buflist))
+        divs = [40,40,20]
+
+        for i, b in enumerate(self.buflist):
+            self.heights.append(len(b))
+            #self.widths.append(avail//3)
+            self.widths.append(avail*divs[i]//100)
+
+def list_to_interval(xs):
+    xs = sorted(xs)
+    rs = []
+    length = len(xs)
+    i = 0
+    while i < length:
+        low = xs[i]
+        while i < length-1 and xs[i]+1 == xs[i + 1]:
+            i += 1
+        high = xs[i]
+        if (high - low >= 1):
+            rs.append("%d-%d"%(low, high))
+        elif (high - low == 1):
+            rs.append("%d,%d"%(low, high))
+        else:
+            rs.append("%d"%low)
+        i += 1
+    return ",".join(rs)
+
+def interval_to_list(s):
+    r = []
+    for e in s.split(","):
+        if "-" in e:
+            beg, end = e.split("-")
+            for i in range(int(beg), int(end)+1):
+                r.append(i)
+        else:
+            r.append(int(e))
+    return r
+
+
+def test_printer():
+    p = Printer(3)
+    p.print("aaa1\naaa2\naaa3", "naaa3\n", col=0)
+    p.print("bbb1\nbbb2\nbbb3\n", col=1)
+    p.print("ccc1\nccc2\nccc3\n", col=2)
+    p.display()
+    p.clear()
+    p.display()
+
+    exit(0)
+if __name__ == "__main__":
+    #test_printer()
+    main()

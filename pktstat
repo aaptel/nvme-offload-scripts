@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+import os
+import re
+import subprocess
+import argparse
+import concurrent.futures
+import time
+import ast
+import sys
+
+IGNORE_ERROR=False
+ETHTOOLDIR=os.getenv('ETHTOOLDIR', "/root/ethtool")
+LINUXDIR=os.getenv('LINUX', "/scratch/aaptel/tcpoffload/linux-git")
+VERBOSE=False
+
+def run_program(command):
+    t = time.time()
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='ascii')
+    output, error = process.communicate()
+    out, err = output, error
+    if not IGNORE_ERROR and (len(err) > 0 or len(out) == 0):
+        print(err, end="")
+        raise Exception("err")
+    return t, out
+
+def parse_ethtool_stats(out):
+    res = {}
+    for s in out.splitlines():
+        if len(s) <= 0 or s[-1] == ':' or ':' not in s or '_' not in s:
+            continue
+        k, v = s.split(':')
+        v = int(v)
+        k = k.strip()
+        res[k] = v
+    return res
+
+def bytes_to_gb(n):
+    s = "%.1f" % (n/1024/1024/1024 * 8)
+    return s.rjust(3+1+1) # XXX.X
+
+def ratio_to_percent(r):
+    return "%3d" % (r*100)
+
+
+def get_iface_index(iface):
+    out = subprocess.check_output(['ip', 'a', 'show', iface], encoding='ascii')
+    m = re.search('^(\d+): ', out)
+    if m:
+        return int(m.group(1))
+    return None
+
+def netlink(ifindex=None):
+    path = os.path.join(LINUXDIR, 'tools/net/ynl/cli.py')
+    t, out = run_program([path,
+                       '--spec', os.path.join(LINUXDIR, 'Documentation/netlink/specs/ulp_ddp.yaml'),
+                       '--do', 'stats-get',
+                       '--json', '{"ifindex": %d}'%ifindex])
+    out = out.replace('-', '_')
+    out = out.replace('nvme_tcp', 'nvmeotcp')
+    out = out.replace('_ddp_', '_')
+    res = ast.literal_eval(out)
+    return t, res
+
+class EthtoolOffloadStatsFetcher:
+    def __init__(self, iface):
+        self.iface = iface
+    def __call__(self):
+        t, out = run_program(['%s/ethtool'%ETHTOOLDIR, '-I', '--show-ulp-ddp', self.iface])
+        return t, parse_ethtool_stats(out)
+
+class EthtoolGlobalStatsFetcher:
+    def __init__(self, iface):
+        self.iface = iface
+    def __call__(self):
+        t, out = run_program(['%s/ethtool'%ETHTOOLDIR, '-S', self.iface])
+        r = parse_ethtool_stats(out)
+        if 'rx_nvmeotcp_offload_bytes' in r:
+            r['rx_nvmeotcp_bytes'] = r['rx_nvmeotcp_offload_bytes']
+            r['rx_nvmeotcp_packets'] = r['rx_nvmeotcp_offload_packets']
+        if 'tx_nvmeotcp_offload_bytes' in r:
+            r['tx_nvmeotcp_bytes'] = r['tx_nvmeotcp_offload_bytes']
+            r['tx_nvmeotcp_packets'] = r['tx_nvmeotcp_offload_packets']
+        return t, r
+
+class NetlinkOffloadStatsFetcher:
+    def __init__(self, iface):
+        self.iface = iface
+        self.ifindex = get_iface_index(self.iface)
+
+    def __call__(self):
+        try:
+            return netlink(self.ifindex)
+        except:
+            for i in range(4):
+                try:
+                    self.ifindex = get_iface_index(self.iface)
+                    return netlink(self.ifindex)
+                except:
+                    time.sleep(4)
+
+def main():
+    ap = argparse.ArgumentParser(description='offload stats')
+    ap.add_argument('iface', help='network interface')
+    ap.add_argument('-i', '--ignore-errors', action='store_true', default=False, help='ignore errors')
+    ap.add_argument('-v', '--verbose', action='store_true', default=False, help='print verbose messages')
+    args = ap.parse_args()
+
+    global IGNORE_ERROR
+    global VERBOSE
+    IGNORE_ERROR = args.ignore_errors
+    VERBOSE = args.verbose
+
+    oldr1 = {}
+    oldr2 = {}
+    oldt1 = time.time()
+    oldt2 = time.time()
+
+    offload_fetcher_list = [
+        EthtoolOffloadStatsFetcher,
+        NetlinkOffloadStatsFetcher,
+    ]
+
+    global_stats_fetcher = EthtoolGlobalStatsFetcher(args.iface)
+    t, test = global_stats_fetcher()
+    all_in_global = 'rx_nvmeotcp_bytes' in test
+
+    if not all_in_global:
+        offload_stats_fetcher = None
+        for f in offload_fetcher_list:
+            r = None
+            try:
+                info('try %s stats...'%f.__name__)
+                offload_stats_fetcher = f(args.iface)
+                r = offload_stats_fetcher()
+            except:
+                info('err.. skipping')
+                offload_stats_fetcher = None
+            else:
+                info('ok')
+                break
+
+        if offload_stats_fetcher is None:
+            info("no fetcher available")
+            exit(1)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first = True
+
+        while True:
+
+            if all_in_global:
+                t1, r1 = global_stats_fetcher()
+                t2, r2 = t1, r1
+            else:
+                ulp_future = executor.submit(offload_stats_fetcher)
+                stat_future = executor.submit(global_stats_fetcher)
+
+                t1, r1 = ulp_future.result()
+                t2, r2 = stat_future.result()
+
+            def D(n):
+                if n in r1:
+                    return (r1.get(n, 0) - oldr1.get(n, 0))/(t1-oldt1)
+                if n in r2:
+                    return (r2.get(n, 0) - oldr2.get(n, 0))/(t2-oldt2)
+                return 0
+
+
+            if not first:
+                rx_b = D('rx_bytes')
+                rx_p = D('rx_packets')
+                rx_b_off = D('rx_nvmeotcp_bytes')
+                rx_p_off = D('rx_nvmeotcp_packets')
+                rx_p_ratio = 0
+                rx_b_ratio = 0
+                if rx_p != 0:
+                    rx_p_ratio = rx_p_off / rx_p
+                if rx_b != 0:
+                    rx_b_ratio = rx_b_off / rx_b
+
+                rx_info = "RX %s Gbps   %s%% off.bytes   %s%% off.pkts"%(bytes_to_gb(rx_b), ratio_to_percent(rx_b_ratio), ratio_to_percent(rx_p_ratio))
+
+                tx_b = D('tx_bytes')
+                tx_p = D('tx_packets')
+                tx_b_off = D('tx_nvmeotcp_bytes')
+                tx_p_off = D('tx_nvmeotcp_packets')
+                tx_p_ratio = 0
+                tx_b_ratio = 0
+                if tx_p != 0:
+                    tx_p_ratio = tx_p_off / tx_p
+                if tx_b != 0:
+                    tx_b_ratio = tx_b_off / tx_b
+
+                tx_info = "TX %s Gbps   %s%% off.bytes   %s%% off.pkts"%(bytes_to_gb(tx_b), ratio_to_percent(tx_b_ratio), ratio_to_percent(tx_p_ratio))
+
+                print(rx_info, tx_info)
+            else:
+                first = False
+
+
+            oldr1 = r1
+            oldr2 = r2
+            oldt1 = t1
+            oldt2 = t2
+            time.sleep(1)
+
+
+def info(s):
+    if VERBOSE:
+        print(s, file=sys.stderr)
+
+if __name__ == '__main__':
+    main()
